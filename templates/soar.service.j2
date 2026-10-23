@@ -1,0 +1,20 @@
+# {{ ansible_managed }}
+[Unit]
+Description=soar DNS tunnel server
+After=network-online.target soar-firewall.service
+Wants=network-online.target
+# Never run without the egress firewall.
+Requires=soar-firewall.service
+
+[Service]
+User=soar
+ExecStart=/usr/local/bin/soar-server -zone {{ soar_zone }} -key-file /etc/soar/key -listen :{{ soar_port }} -allow-ports {{ soar_allow_ports }}
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

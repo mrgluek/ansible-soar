@@ -1,0 +1,35 @@
+# {{ ansible_managed }}
+# soar DNS tunnel traffic counters (read and reset by soar-stats-collect).
+# Users are never visible here: tunnel queries arrive from the egress
+# addresses of recursive resolvers, which is what q4/a4 count.
+table inet soarstats
+delete table inet soarstats
+table inet soarstats {
+	# Queries from resolver egress addresses = users' upload.
+	set q4 { type ipv4_addr; size 65536; flags dynamic,timeout; timeout 1h; counter; }
+	# Answers soar sent back to them = users' download.
+	set a4 { type ipv4_addr; size 65536; flags dynamic,timeout; timeout 1h; counter; }
+	# Relay side: new TCP connections (packets = connections) and bytes sent.
+	set rc4 { type ipv4_addr; size 4096; flags dynamic,timeout; timeout 1h; counter; }
+	set rb4 { type ipv4_addr; size 4096; flags dynamic,timeout; timeout 1h; counter; }
+	# Bytes relays sent back. Replies carry no socket owner, so soar's relay
+	# connections are marked on the way out and counted by that mark.
+	set rd4 { type ipv4_addr; size 4096; flags dynamic,timeout; timeout 1h; counter; }
+
+	# Before the nat REDIRECT 53 -> 5302 (priority -100): dport is still 53.
+	chain pre {
+		type filter hook prerouting priority -200; policy accept;
+		iifname "{{ soar_iface }}" udp dport 53 update @q4 { ip saddr }
+	}
+	chain out {
+		type filter hook output priority 0; policy accept;
+		meta skuid "soar" ip daddr != 127.0.0.0/8 meta l4proto udp update @a4 { ip daddr }
+		meta skuid "soar" ip daddr != 127.0.0.0/8 tcp flags & (syn | ack) == syn update @rc4 { ip daddr }
+		meta skuid "soar" ip daddr != 127.0.0.0/8 meta l4proto tcp update @rb4 { ip daddr }
+		meta skuid "soar" ip daddr != 127.0.0.0/8 meta l4proto tcp ct mark set 0x50a7
+	}
+	chain in {
+		type filter hook input priority 0; policy accept;
+		ct mark 0x50a7 meta l4proto tcp update @rd4 { ip saddr }
+	}
+}

@@ -1,0 +1,330 @@
+---
+# soar DNS tunnel server (https://github.com/getlantern/soar) for Velta Tunnel.
+#
+#   ansible-playbook -i inventory.ini soar_setup.yml -l <host>
+#
+# Inventory: put the server in group [soar] with soar_zone=<zone>; see
+# inventory.example.ini and README.md. Re-running is safe; the key on the
+# server is never replaced unless soar_key says so.
+
+- name: Build soar-server on the control machine
+  hosts: soar
+  gather_facts: yes
+  become: no
+  # Only touches the local build directory, so it also runs under --check
+  # (the server play needs the binary to diff against).
+  check_mode: false
+
+  vars:
+    soar_version: v0.2.0
+    soar_build_dir: "{{ playbook_dir }}/.build"
+    # ansible_facts.architecture -> GOARCH
+    soar_goarch_map: { x86_64: amd64, aarch64: arm64, armv7l: arm }
+
+  tasks:
+    # Built locally: servers are small (1 GB RAM) and may lack a recent Go.
+    # One build per architecture and version, reused on later runs.
+    - name: Fetch soar source at {{ soar_version }}
+      delegate_to: localhost
+      run_once: yes
+      ansible.builtin.git:
+        repo: https://github.com/getlantern/soar.git
+        dest: "{{ soar_build_dir }}/soar-{{ soar_version }}"
+        version: "{{ soar_version }}"
+        depth: 1
+
+    - name: Build soar-server for each target architecture
+      delegate_to: localhost
+      run_once: yes
+      ansible.builtin.command:
+        cmd: go build -trimpath -ldflags=-s -o {{ soar_build_dir }}/soar-server-{{ soar_version }}-linux-{{ item }} ./cmd/soar-server
+        chdir: "{{ soar_build_dir }}/soar-{{ soar_version }}"
+        creates: "{{ soar_build_dir }}/soar-server-{{ soar_version }}-linux-{{ item }}"
+      environment:
+        CGO_ENABLED: "0"   # static binary, no glibc version coupling
+        GOOS: linux
+        GOARCH: "{{ item }}"
+      loop: >-
+        {{ ansible_play_hosts | map('extract', hostvars, ['ansible_facts', 'architecture'])
+           | map('extract', soar_goarch_map) | unique | list }}
+
+- name: soar DNS tunnel server
+  hosts: soar
+  gather_facts: no   # gathered by the play above
+  become: yes
+
+  vars:
+    soar_version: v0.2.0
+    soar_build_dir: "{{ playbook_dir }}/.build"
+    soar_goarch_map: { x86_64: amd64, aarch64: arm64, armv7l: arm }
+    # Interface that receives the public DNS queries (eth0, ens3, ...).
+    soar_iface: "{{ ansible_facts.default_ipv4.interface }}"
+    # soar listens here; public port 53 is redirected to it, so soar needs no
+    # root and nothing else on the box has to give up port 53 on loopback.
+    soar_port: 5302
+    # Destination ports soar may open (IMAP/SMTP/HTTPS of chatmail relays).
+    soar_allow_ports: "143,443,465,587,993"
+    # Name server the zone is delegated to (its A record must be this server).
+    soar_ns: "{{ inventory_hostname }}"
+    soar_stats: true
+    # Relay hostnames soar may reach, kept next to the inventory rather than
+    # in this repo: a published list of the relays tunnel users depend on is
+    # a ready-made block list. See files/relays.example.txt.
+    soar_relays_file: "{{ inventory_dir }}/soar-relays.txt"
+    # Optional extra resolver network names for soar-stats ("ASN label" lines).
+    soar_asn_labels_file: "{{ inventory_dir }}/soar-asn-labels.txt"
+    # soar_key: base64 private key (ansible-vault). Unset = keep the key on the
+    # server, or generate one there on first run.
+
+  pre_tasks:
+    - name: Check the inventory
+      ansible.builtin.assert:
+        that:
+          - soar_zone is defined and soar_zone | length > 0
+          - ansible_facts.os_family == 'Debian'
+          - ansible_facts.architecture in soar_goarch_map
+        fail_msg: "Set soar_zone for {{ inventory_hostname }} (Debian/Ubuntu, x86_64/aarch64/armv7l only)"
+
+    - name: Check the relay list
+      ansible.builtin.assert:
+        that: soar_relays_file is file   # tested on the control machine
+        fail_msg: >-
+          No relay list at {{ soar_relays_file }}: copy files/relays.example.txt
+          there (or set soar_relays_file) and list the relays to allow.
+
+    - name: Install tools
+      ansible.builtin.apt:
+        name: [ipset, iptables, nftables, bind9-dnsutils, python3, systemd-resolved]
+        state: present
+        update_cache: yes
+        cache_valid_time: 86400
+
+    # SOAR_OUT only lets soar talk DNS to 127.0.0.53, so the system resolver
+    # must be systemd-resolved's stub (default on Ubuntu, not on Debian).
+    - name: Check that systemd-resolved serves 127.0.0.53
+      ansible.builtin.command: resolvectl query -4 --legend=no {{ soar_ns }}
+      changed_when: false
+
+    # The redirect takes public UDP 53 away from anything bound to it, which
+    # would silently break an authoritative DNS server already on this box.
+    - name: Check that nothing else serves public UDP 53
+      ansible.builtin.shell: ss -Hlun 'sport = :53' | awk '{print $4}' | grep -vE '^(127\.|\[::1\]|\[?::ffff:127\.)' || true
+      register: soar_port53
+      changed_when: false
+      failed_when: soar_port53.stdout | length > 0
+
+  tasks:
+    - name: soar system user
+      ansible.builtin.user:
+        name: soar
+        system: yes
+        shell: /usr/sbin/nologin
+        create_home: no
+
+    - name: soar-server binary
+      ansible.builtin.copy:
+        src: "{{ soar_build_dir }}/soar-server-{{ soar_version }}-linux-{{ soar_goarch_map[ansible_facts.architecture] }}"
+        dest: /usr/local/bin/soar-server
+        mode: "0755"
+      notify: restart soar
+
+    - name: /etc/soar
+      ansible.builtin.file:
+        path: /etc/soar
+        state: directory
+        owner: root
+        group: soar
+        mode: "0750"
+
+    - name: Private key from soar_key
+      when: soar_key is defined
+      ansible.builtin.copy:
+        content: "{{ soar_key | trim }}\n"
+        dest: /etc/soar/key
+        owner: root
+        group: soar
+        mode: "0640"
+      no_log: true
+      notify: restart soar
+
+    # Generated on the server and written straight to the file: the private
+    # key never passes through Ansible output or the control machine.
+    - name: Generate a private key on the server (first run only)
+      when: soar_key is not defined
+      ansible.builtin.shell: |
+        set -e
+        umask 027
+        /usr/local/bin/soar-server keygen | awk '$1 == "private" {print $2}' > /etc/soar/key.new
+        chgrp soar /etc/soar/key.new
+        mv /etc/soar/key.new /etc/soar/key
+      args:
+        creates: /etc/soar/key
+      notify: restart soar
+
+    - name: Read the public key
+      ansible.builtin.command: /usr/local/bin/soar-server pubkey /etc/soar/key
+      register: soar_pubkey
+      changed_when: false
+      check_mode: false   # read-only; also needed for the summary in --check
+
+    - name: /etc/soar/pubkey
+      ansible.builtin.copy:
+        content: "{{ soar_pubkey.stdout }}\n"
+        dest: /etc/soar/pubkey
+        mode: "0644"
+
+    - name: Relay allowlist
+      ansible.builtin.copy:
+        src: "{{ soar_relays_file }}"
+        dest: /etc/soar/relays.txt
+        mode: "0644"
+      notify: refresh relays
+
+    - name: Scripts
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: /usr/local/sbin/{{ item }}
+        mode: "0755"
+      loop: [soar-relays-update, soar-stats]
+      notify: refresh relays
+
+    - name: Resolver network labels for soar-stats
+      when: soar_stats | bool and soar_asn_labels_file is file
+      ansible.builtin.copy:
+        src: "{{ soar_asn_labels_file }}"
+        dest: /etc/soar/asn-labels.txt
+        mode: "0644"
+
+    - name: Firewall script
+      ansible.builtin.template:
+        src: soar-firewall.j2
+        dest: /usr/local/sbin/soar-firewall
+        mode: "0755"
+      notify: restart soar-firewall
+
+    - name: Static units
+      ansible.builtin.copy:
+        src: systemd/{{ item }}
+        dest: /etc/systemd/system/{{ item }}
+        mode: "0644"
+      loop:
+        - soar-firewall.service
+        - soar-relays.service
+        - soar-relays.timer
+        - soar-stats-nft.service
+        - soar-stats-collect.service
+        - soar-stats-collect.timer
+      notify: restart soar-firewall
+
+    - name: soar.service
+      ansible.builtin.template:
+        src: soar.service.j2
+        dest: /etc/systemd/system/soar.service
+        mode: "0644"
+      notify: restart soar
+
+    - name: Traffic counters (nftables)
+      when: soar_stats | bool
+      ansible.builtin.template:
+        src: stats.nft.j2
+        dest: /etc/soar/stats.nft
+        mode: "0644"
+      notify: restart soar-stats-nft
+
+    - name: Stats database directory
+      when: soar_stats | bool
+      ansible.builtin.file:
+        path: /var/lib/soar-stats
+        state: directory
+        mode: "0700"
+
+    - name: Enable firewall, relay refresh and soar
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        enabled: yes
+        state: started
+        daemon_reload: yes
+      loop: [soar-firewall.service, soar-relays.timer, soar.service]
+
+    - name: Enable or disable traffic stats
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        enabled: "{{ soar_stats | bool }}"
+        state: "{{ 'started' if soar_stats | bool else 'stopped' }}"
+      loop: [soar-stats-nft.service, soar-stats-collect.timer]
+
+    - name: Apply pending restarts before checking
+      ansible.builtin.meta: flush_handlers
+
+    # Fill the relay set on a fresh server; later the timer keeps it fresh.
+    - name: Count relay addresses
+      ansible.builtin.shell: ipset list soar_relays | grep -c '^[0-9]' || true
+      register: soar_relay_count
+      changed_when: false
+      check_mode: false
+
+    - name: Resolve relays now (empty set)
+      when: soar_relay_count.stdout | int == 0
+      ansible.builtin.systemd_service:
+        name: soar-relays.service
+        state: started
+
+    # Straight to the server's port 53, as a resolver would: proves the
+    # redirect, soar and the zone name, independent of public delegation.
+    - name: Query soar through public port 53
+      delegate_to: localhost
+      become: no
+      ansible.builtin.command: dig +norec +time=3 +tries=2 @{{ ansible_facts.default_ipv4.address }} soar-check.{{ soar_zone }} TXT
+      register: soar_direct
+      changed_when: false
+      check_mode: false
+      failed_when: "'status: NOERROR' not in soar_direct.stdout or ' aa' not in soar_direct.stdout"
+
+    # Asked at the parent zone's own name server: a recursive resolver would
+    # follow the delegation to soar itself, which serves no NS records.
+    - name: Check the public delegation
+      delegate_to: localhost
+      become: no
+      ansible.builtin.shell: |
+        parent=$(dig +short NS {{ soar_zone.split('.', 1)[1] }} | head -1)
+        dig +norec +noall +authority +answer +time=3 NS {{ soar_zone }} @"$parent" | awk '$4 == "NS" {print $5}'
+      register: soar_delegation
+      changed_when: false
+      check_mode: false
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg:
+          - "zone {{ soar_zone }} -> {{ ansible_facts.default_ipv4.address }} ({{ soar_iface }}:53 -> soar:{{ soar_port }}), soar {{ soar_version }}"
+          - "relays in allowlist: {{ soar_relay_count.stdout }}"
+          - >-
+            {{ 'delegation OK: ' ~ soar_zone ~ ' NS ' ~ soar_ns
+               if (soar_ns ~ '.') in soar_delegation.stdout_lines
+               else 'DELEGATION MISSING - add in the parent zone: ' ~ soar_zone ~ ' NS ' ~ soar_ns
+                    ~ '  and  ' ~ soar_ns ~ ' A ' ~ ansible_facts.default_ipv4.address ~ ' (DNS only, not proxied)' }}
+          - "public key: {{ soar_pubkey.stdout }}"
+          - "Velta link: velta://tunnel?v=1&zone={{ soar_zone }}&key={{ soar_pubkey.stdout | replace('+', '-') | replace('/', '_') | regex_replace('=+$', '') }}"
+
+  handlers:
+    - name: restart soar-firewall
+      ansible.builtin.systemd_service:
+        name: soar-firewall.service
+        state: restarted
+        daemon_reload: yes
+
+    - name: restart soar-stats-nft
+      ansible.builtin.systemd_service:
+        name: soar-stats-nft.service
+        state: restarted
+      when: soar_stats | bool
+
+    - name: restart soar
+      ansible.builtin.systemd_service:
+        name: soar.service
+        state: restarted
+        daemon_reload: yes
+
+    - name: refresh relays
+      ansible.builtin.systemd_service:
+        name: soar-relays.service
+        state: started

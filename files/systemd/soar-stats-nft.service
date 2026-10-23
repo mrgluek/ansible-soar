@@ -1,0 +1,13 @@
+[Unit]
+Description=soar tunnel traffic counters (nftables)
+After=network-pre.target
+Before=soar.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/soar/stats.nft
+ExecStop=/usr/sbin/nft delete table inet soarstats
+
+[Install]
+WantedBy=multi-user.target

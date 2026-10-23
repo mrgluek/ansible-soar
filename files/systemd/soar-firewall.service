@@ -1,0 +1,17 @@
+[Unit]
+Description=soar DNS tunnel firewall (port 53 redirect, egress allowlist)
+# Early, before networking comes up, so there is no window in which soar
+# runs without its egress restrictions.
+DefaultDependencies=no
+Wants=network-pre.target
+Before=network-pre.target soar.service soar-relays.service
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/soar-firewall start
+ExecStop=/usr/local/sbin/soar-firewall stop
+
+[Install]
+WantedBy=multi-user.target

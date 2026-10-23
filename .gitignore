@@ -1,0 +1,10 @@
+.build/
+inventory.ini
+*.vault.yml
+host_vars/
+group_vars/
+.DS_Store
+soar-relays.txt
+relays.txt
+__pycache__/
+soar-asn-labels.txt

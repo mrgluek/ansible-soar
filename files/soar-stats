@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+"""soar DNS tunnel statistics from kernel counters (table inet soarstats).
+
+  soar-stats collect          read and reset the counters into SQLite (timer)
+  soar-stats [report] [-d N]  summary of the last N days (default 1)
+      --min Q     hide resolver networks (ASNs) with fewer than Q queries
+      --top N     rows per table
+      --hours     add an hourly activity table
+
+Only resolver egress addresses and relay addresses are stored: soar never
+sees users' own addresses. Samples older than 90 days are pruned.
+"""
+import argparse
+import ipaddress
+import json
+import socket
+import sqlite3
+import subprocess
+import sys
+import time
+from collections import defaultdict
+
+DB = "/var/lib/soar-stats/stats.db"
+RELAYS = "/etc/soar/relays.txt"
+# nft set -> sample kind: queries in / answers out (resolver side),
+# connections / bytes sent / bytes received (relay side)
+SETS = {"q4": "q", "a4": "a", "rc4": "rc", "rb4": "rb", "rd4": "rd"}
+KEEP_DAYS = 90
+ASN_TTL = 30 * 86400
+LOOKUPS_PER_RUN = 300  # new prefixes looked up per collect run
+
+# What the resolver egress of an ASN usually is. A guess where marked "?".
+# Local additions: /etc/soar/asn-labels.txt, lines "ASN label", "#" comments.
+SERVICES = {
+    "15169": "Google Public DNS",
+    "13335": "Cloudflare DNS",
+    "19281": "Quad9",
+    "42": "Quad9 (PCH)",
+    "715": "Quad9 (PCH)",
+    "49544": "Quad9 (i3D.net)",
+    "42473": "NextDNS (Anexia)",
+    "36236": "SafeDNS (NetActuate)",
+    "60068": "AdGuard DNS (CDN77)",
+    "36692": "Cisco OpenDNS",
+    "16509": "AWS: resolver service?",
+    "14618": "AWS: scanners?",
+}
+LABELS = "/etc/soar/asn-labels.txt"
+try:
+    for line in open(LABELS):
+        asn, _, label = line.split("#", 1)[0].strip().partition(" ")
+        if asn and label.strip():
+            SERVICES[asn.removeprefix("AS")] = label.strip()
+except OSError:
+    pass
+
+
+def db():
+    con = sqlite3.connect(DB)
+    con.executescript("""
+        CREATE TABLE IF NOT EXISTS samples (
+            ts INTEGER NOT NULL, kind TEXT NOT NULL, ip TEXT NOT NULL,
+            pkts INTEGER NOT NULL, bytes INTEGER NOT NULL);
+        CREATE INDEX IF NOT EXISTS samples_ts ON samples (ts);
+        DROP TABLE IF EXISTS asn;  -- old per-address cache
+        CREATE TABLE IF NOT EXISTS asn_prefix (
+            prefix TEXT PRIMARY KEY, asn TEXT, cc TEXT, name TEXT, ts INTEGER);
+    """)
+    return con
+
+
+def prefix_of(ip):
+    """Cache key: /24 or /48. Cymru answers per routed prefix, never smaller."""
+    a = ipaddress.ip_address(ip)
+    return str(ipaddress.ip_network(f"{ip}/{24 if a.version == 4 else 48}", strict=False))
+
+
+def dig_txt(name):
+    out = subprocess.run(["dig", "+short", "+time=2", "+tries=1", "TXT", name],
+                         capture_output=True, text=True).stdout.strip()
+    return out.split("\n")[0].strip('"') if out else ""
+
+
+def cymru(ip):
+    a = ipaddress.ip_address(ip)
+    if a.version == 4:
+        q = ".".join(reversed(ip.split("."))) + ".origin.asn.cymru.com"
+    else:
+        q = ".".join(reversed(a.exploded.replace(":", ""))) + ".origin6.asn.cymru.com"
+    origin = dig_txt(q)  # "13335 | 1.1.1.0/24 | AU | apnic | 2011-08-11"
+    if not origin:
+        return "?", "?", "?"
+    parts = [p.strip() for p in origin.split("|")]
+    asn, cc = parts[0].split()[0], parts[2]
+    info = dig_txt(f"AS{asn}.asn.cymru.com")  # "13335 | US | arin | ... | CLOUDFLARENET, US"
+    return asn, cc, info.split("|")[-1].strip() if info else "?"
+
+
+def asn_of(con, ip, lookup=True):
+    pfx = prefix_of(ip)
+    row = con.execute("SELECT asn, cc, name, ts FROM asn_prefix WHERE prefix = ?", (pfx,)).fetchone()
+    if row and (row[3] > time.time() - ASN_TTL or not lookup):
+        return row[:3]
+    if not lookup:
+        return "?", "?", "?"
+    asn, cc, name = cymru(ip)
+    with con:
+        con.execute("INSERT OR REPLACE INTO asn_prefix VALUES (?,?,?,?,?)", (pfx, asn, cc, name, int(time.time())))
+    return asn, cc, name
+
+
+def collect():
+    now = int(time.time())
+    rows = []
+    for name, kind in SETS.items():
+        # reset = list + zero in one atomic step, so nothing is counted twice or lost
+        out = subprocess.run(["nft", "-j", "reset", "set", "inet", "soarstats", name],
+                             check=True, capture_output=True, text=True).stdout
+        for item in json.loads(out)["nftables"]:
+            for e in item.get("set", {}).get("elem", []):
+                e = e.get("elem", {})
+                c = e.get("counter") or {}
+                if c.get("packets"):
+                    rows.append((now, kind, e["val"], c["packets"], c["bytes"]))
+    rows += rejected(now)
+    con = db()
+    with con:
+        con.executemany("INSERT INTO samples VALUES (?,?,?,?,?)", rows)
+        con.execute("DELETE FROM samples WHERE ts < ?", (now - KEEP_DAYS * 86400,))
+    # Look ASNs up here, a few hundred new prefixes per run, so reports never wait on DNS.
+    known = {r[0] for r in con.execute("SELECT prefix FROM asn_prefix WHERE ts > ?", (now - ASN_TTL,))}
+    todo = {}
+    for (ip,) in con.execute("SELECT DISTINCT ip FROM samples WHERE kind = 'q' AND ts > ?", (now - 86400,)):
+        pfx = prefix_of(ip)
+        if pfx not in known:
+            todo.setdefault(pfx, ip)
+    for ip in list(todo.values())[:LOOKUPS_PER_RUN]:
+        asn_of(con, ip)
+
+
+def rejected(now):
+    """Destinations the egress firewall refused (iptables SOAR_OUT adds them
+    to ipset soar_rejected with counters): relays missing from relays.txt."""
+    out = subprocess.run(["ipset", "save", "soar_rejected"], capture_output=True, text=True).stdout
+    subprocess.run(["ipset", "flush", "soar_rejected"], capture_output=True)
+    rows = []
+    for line in out.splitlines():
+        f = line.split()  # add soar_rejected 1.2.3.4,tcp:443 timeout 3590 packets 3 bytes 180
+        if len(f) < 3 or f[0] != "add":
+            continue
+        kv = dict(zip(f[3::2], f[4::2]))
+        ip, _, port = f[2].partition(",")
+        if int(kv.get("packets", 0)):
+            rows.append((now, "rj", f"{ip}:{port.split(':')[-1]}", int(kv["packets"]), int(kv.get("bytes", 0))))
+    return rows
+
+
+def ptr(ip):
+    out = subprocess.run(["dig", "+short", "+time=2", "+tries=1", "-x", ip], capture_output=True, text=True).stdout
+    return out.split("\n")[0].rstrip(".") or "?"
+
+
+def relay_names():
+    names = {}
+    try:
+        # Anything after "#" is a comment, also at the end of a hostname line.
+        hosts = [h for h in (l.split("#", 1)[0].strip() for l in open(RELAYS)) if h]
+    except OSError:
+        return names
+    for h in hosts:
+        try:
+            for ai in socket.getaddrinfo(h, 443, socket.AF_INET, socket.SOCK_STREAM):
+                names.setdefault(ai[4][0], h)
+        except OSError:
+            pass
+    return names
+
+
+def mb(n):
+    return f"{n / 1e6:.1f}"
+
+
+def table(head, rows):
+    cells = [[str(x) for x in r] for r in [head] + rows]
+    w = [max(len(c[i]) for c in cells) for i in range(len(head))]
+    num = lambda v: v.replace(".", "", 1).isdigit()
+    for c in cells:  # numbers right-aligned, text left-aligned
+        print("  " + "  ".join(v.rjust(w[i]) if num(v) else v.ljust(w[i]) for i, v in enumerate(c)))
+
+
+def report(args):
+    con = db()
+    first = con.execute("SELECT MIN(ts) FROM samples").fetchone()[0]
+    if not first:
+        print("no samples yet (the collector runs every 10 minutes)")
+        return
+    since = int(time.time()) - int(args.days * 86400)
+    per = defaultdict(lambda: defaultdict(lambda: [0, 0]))
+    for kind, ip, p, b in con.execute(
+            "SELECT kind, ip, SUM(pkts), SUM(bytes) FROM samples WHERE ts >= ? GROUP BY kind, ip", (since,)):
+        per[kind][ip] = [p, b]
+
+    # Group resolver addresses by network first: Google alone spreads one
+    # user's queries over dozens of egress addresses, each below any
+    # per-address threshold. Scanners are small networks, not small addresses.
+    nets = defaultdict(lambda: {"ips": [], "q": 0, "qb": 0, "ab": 0, "cc": "?", "name": "?"})
+    for ip, (p, b) in per["q"].items():
+        asn, cc, name = asn_of(con, ip, lookup=args.lookup)
+        n = nets[asn]
+        n["ips"].append(ip)
+        n["q"] += p
+        n["qb"] += b
+        n["ab"] += per["a"][ip][1]
+        n["cc"], n["name"] = cc, name
+    real = {k: v for k, v in nets.items() if v["q"] >= args.min}
+    noise_q = sum(v["q"] for k, v in nets.items() if k not in real)
+    q_pk = sum(v["q"] for v in real.values())
+    q_b = sum(v["qb"] for v in real.values())
+    a_b = sum(v["ab"] for v in real.values())
+    real_ips = {ip for v in real.values() for ip in v["ips"]}
+    relay_up = sum(b for _, b in per["rb"].values())
+    relay_down = sum(b for _, b in per["rd"].values())
+
+    print(f"soar tunnel, last {args.days:g} day(s); data since {time.strftime('%Y-%m-%d %H:%M', time.localtime(first))}")
+    print(f"  resolver networks carrying the tunnel: {len(real)} ({len(real_ips)} addresses, >= {args.min} queries per network);"
+          f" {len(nets) - len(real)} other networks sent {noise_q} queries (scanners, probes)")
+    print(f"  queries in:  {q_pk:>10} pkts  {mb(q_b):>8} MB   (users' upload, DNS-encoded)")
+    print(f"  answers out: {sum(per['a'][ip][0] for ip in real_ips):>10} pkts  {mb(a_b):>8} MB   (users' download, DNS-encoded)")
+    print(f"  relays: {sum(p for p, _ in per['rc'].values())} connections, {mb(relay_up)} MB sent, {mb(relay_down)} MB received")
+    if relay_down:
+        print(f"  DNS overhead: {a_b / relay_down:.1f} MB of answers per MB of mail received"
+              f"{f', {q_b / relay_up:.1f} MB of queries per MB sent' if relay_up else ''}")
+
+    print("\nresolver networks (who carries the tunnel):")
+    table(["asn", "cc", "service", "name", "addrs", "queries", "MB in", "MB out"],
+          [[f"AS{k}", v["cc"], SERVICES.get(k, ""), v["name"][:28], len(v["ips"]), v["q"], mb(v["qb"]), mb(v["ab"])]
+           for k, v in sorted(real.items(), key=lambda kv: -kv[1]["q"])][:args.top])
+
+    rows = []
+    for k, v in real.items():
+        for ip in v["ips"]:
+            rows.append([ip, f"AS{k}", SERVICES.get(k, v["name"][:20]), per["q"][ip][0], mb(per["q"][ip][1]), mb(per["a"][ip][1])])
+    rows.sort(key=lambda r: -r[3])
+    print("\ntop resolver addresses:")
+    table(["address", "asn", "service", "queries", "MB in", "MB out"], rows[:args.top])
+
+    names = relay_names()
+    rel = sorted(set(per["rc"]) | set(per["rb"]) | set(per["rd"]), key=lambda i: -per["rd"][i][1])
+    print("\nrelays reached through the tunnel:")
+    table(["address", "host", "conns", "MB sent", "MB recv"],
+          [[ip, names.get(ip, "?"), per["rc"][ip][0], mb(per["rb"][ip][1]), mb(per["rd"][ip][1])] for ip in rel][:args.top])
+
+    if per["rj"]:
+        print("\nrefused by the egress firewall (not in /etc/soar/relays.txt):")
+        rj = sorted(per["rj"].items(), key=lambda kv: -kv[1][0])[:args.top]
+        table(["address:port", "reverse name", "packets"],
+              [[k, ptr(k.rsplit(":", 1)[0]), v[0]] for k, v in rj])
+
+    if args.hours:
+        print("\nhourly (networks above the threshold):")
+        hours = defaultdict(lambda: [0, 0, set()])
+        for ts, kind, ip, p, b in con.execute(
+                "SELECT ts, kind, ip, pkts, bytes FROM samples WHERE ts >= ? AND kind IN ('q','a')", (since,)):
+            if ip not in real_ips:
+                continue
+            h = hours[time.strftime("%m-%d %H:00", time.localtime(ts - 1))]
+            if kind == "q":
+                h[0] += p
+                h[2].add(ip)
+            else:
+                h[1] += b
+        table(["hour", "queries", "MB out", "addrs"],
+              [[k, v[0], mb(v[1]), len(v[2])] for k, v in sorted(hours.items())])
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("cmd", nargs="?", default="report", choices=["report", "collect"])
+    ap.add_argument("-d", "--days", type=float, default=1)
+    ap.add_argument("--min", type=int, default=50)
+    ap.add_argument("--top", type=int, default=25)
+    ap.add_argument("--hours", action="store_true")
+    ap.add_argument("--no-lookup", dest="lookup", action="store_false",
+                    help="use cached ASNs only (unknown prefixes show as AS?)")
+    args = ap.parse_args()
+    if args.cmd == "collect":
+        collect()
+    else:
+        report(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

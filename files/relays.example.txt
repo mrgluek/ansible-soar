@@ -1,0 +1,38 @@
+# Chatmail relays the soar tunnel may reach (mail ports only), one hostname
+# per line. Copy next to your inventory as soar-relays.txt (or point
+# soar_relays_file at it) and add the relays your users need.
+#
+# Keep your real list out of public repositories: a ready list of "relays
+# the tunnel users need" is a convenient block list. Everything below is
+# already public.
+#
+# Maintainer's relays:
+chatmail.uk
+chat.gluek.info
+
+# Public relays from https://chatmail.at/relays (2026-10-23):
+nine.testrun.org                 # default onboarding relay of many apps
+mehl.cloud                       # German speaking users
+mailchat.pl                      # Polish speaking users
+chatmail.woodpeckersnest.space   # Italian speaking users
+chatmail.culturanerd.it          # Italian speaking users
+chat.adminforge.de               # Falkenstein, DE
+chika.aangat.lahat.computer      # Santa Clara, US
+tarpit.fun                       # Nuremberg, DE
+d.gaufr.es                       # Roubaix, FR
+chtml.ca                         # Quebec, CA
+chatmail.au                      # Melbourne, AU
+e2ee.wang                        # Johannesburg, ZA
+chat.privittytech.com            # Bangalore, IN
+e2ee.im                          # Orastie, RO
+chatmail.email                   # Warsaw, PL
+chat.in-the.eu                   # Falkenstein, DE
+chat.nuvon.app                   # Prague, CZ
+nibblehole.com                   # Zug, CH
+chat.sus.fr                      # IS, JP, KE, ZA
+delta.thelab.uno                 # Gravelines, FR
+chat.vim.wtf                     # Frankfurt, DE
+uninterest.ing                   # Elk Grove Village, US
+sweetfern.net                    # Ashburn, US
+delta.disobey.net                # Roon, NL
+toque.im                         # Quebec, CA

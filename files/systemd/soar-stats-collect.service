@@ -1,0 +1,7 @@
+[Unit]
+Description=Collect soar tunnel traffic counters
+After=soar-stats-nft.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/soar-stats collect

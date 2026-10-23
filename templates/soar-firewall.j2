@@ -1,0 +1,86 @@
+#!/bin/sh
+# {{ ansible_managed }}
+#
+# Firewall for the soar DNS tunnel:
+#   - public UDP 53 on {{ soar_iface }} is redirected to soar on {{ soar_port }};
+#   - everything the soar user sends goes through chain SOAR_OUT, which only
+#     lets it reach chatmail relays (ipset soar_relays) on mail ports and the
+#     local resolver; anything else is refused and recorded in soar_rejected;
+#   - the soar user gets no IPv6 at all.
+#
+#   soar-firewall [start]   (re)apply, safe to run any number of times
+#   soar-firewall stop      remove the rules (ipsets are kept)
+#
+# Standalone on purpose: no iptables-persistent/netfilter-persistent, which
+# apt removes as soon as anything installs ufw (that is how the tunnel lost
+# its rules after a reboot on 2026-10-19). Rules are added next to whatever
+# else is there (ufw, docker, fail2ban), never with iptables-restore, which
+# would wipe their chains. Every rule carries the comment "soar" so it can be
+# found and removed again, even after the interface or port changed.
+set -eu
+
+IFACE={{ soar_iface }}
+PORT={{ soar_port }}
+MAIL_PORTS={{ soar_allow_ports }}
+SAVED=/etc/soar/relays.ipset
+
+# Delete every rule tagged "soar" from one chain. iptables -S prints rules as
+# "-A CHAIN args"; turning -A into -D gives the matching delete command.
+unsoar() {
+    cmd=$1 table=$2 chain=$3
+    $cmd -t "$table" -S "$chain" 2>/dev/null | grep -- '--comment soar' | sed 's/^-A /-D /' |
+        while read -r rule; do eval "$cmd -t $table $rule"; done
+}
+
+stop() {
+    unsoar iptables nat PREROUTING
+    unsoar iptables filter INPUT
+    unsoar iptables filter OUTPUT
+    if iptables -n -L SOAR_OUT >/dev/null 2>&1; then
+        iptables -F SOAR_OUT
+        iptables -X SOAR_OUT
+    fi
+    if [ -e /proc/net/if_inet6 ]; then
+        unsoar ip6tables filter OUTPUT
+    fi
+}
+
+start() {
+    # ipsets first: the rules below refer to them by name. The relay list is
+    # restored from the last refresh, so soar can reach relays right after a
+    # reboot, before soar-relays.timer gets DNS to resolve them again.
+    if [ -s "$SAVED" ]; then
+        ipset restore -exist < "$SAVED"
+    fi
+    ipset create -exist soar_relays hash:ip timeout 86400
+    # Refused destinations with counters; soar-stats reads and flushes it.
+    ipset create -exist soar_rejected hash:ip,port timeout 3600 counters
+
+    stop
+
+    iptables -N SOAR_OUT
+    iptables -A SOAR_OUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    iptables -A SOAR_OUT -p tcp -m set --match-set soar_relays dst \
+        -m multiport --dports "$MAIL_PORTS" -j ACCEPT
+    # soar resolves relay names through systemd-resolved.
+    iptables -A SOAR_OUT -d 127.0.0.53 -p udp --dport 53 -j ACCEPT
+    iptables -A SOAR_OUT -d 127.0.0.53 -p tcp --dport 53 -j ACCEPT
+    iptables -A SOAR_OUT -j SET --add-set soar_rejected dst,dst --exist
+    iptables -A SOAR_OUT -j REJECT
+
+    iptables -I OUTPUT -m owner --uid-owner soar -m comment --comment soar -j SOAR_OUT
+    # Redirected packets arrive on $PORT; accept them even if ufw is enabled.
+    iptables -I INPUT -i "$IFACE" -p udp --dport "$PORT" -m comment --comment soar -j ACCEPT
+    iptables -t nat -I PREROUTING -i "$IFACE" -p udp --dport 53 -m comment --comment soar \
+        -j REDIRECT --to-ports "$PORT"
+
+    if [ -e /proc/net/if_inet6 ]; then
+        ip6tables -I OUTPUT -m owner --uid-owner soar -m comment --comment soar -j REJECT
+    fi
+}
+
+case "${1:-start}" in
+    start) start ;;
+    stop) stop ;;
+    *) echo "usage: $0 [start|stop]" >&2; exit 2 ;;
+esac

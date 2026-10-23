@@ -1,0 +1,21 @@
+#!/bin/sh
+# Resolves /etc/soar/relays.txt into the ipset soar_relays that chain SOAR_OUT
+# allows on mail ports. Entries expire after a day unless refreshed, so a
+# transient DNS failure never drops a relay and addresses a relay stopped
+# using age out on their own. The set is saved for soar-firewall to restore
+# at boot.
+set -eu
+LIST=/etc/soar/relays.txt
+SET=soar_relays
+ipset create -exist "$SET" hash:ip timeout 86400
+n=0
+# Anything after "#" is a comment, also at the end of a hostname line.
+for h in $(sed 's/#.*//' "$LIST" | tr -d ' \t\r' | grep .); do
+  for ip in $(getent ahostsv4 "$h" | awk '{print $1}' | sort -u); do
+    ipset add -exist "$SET" "$ip" timeout 86400
+    n=$((n+1))
+  done
+done
+ipset save "$SET" > /etc/soar/relays.ipset.tmp
+mv /etc/soar/relays.ipset.tmp /etc/soar/relays.ipset
+echo "$SET: refreshed $n addresses, $(ipset list "$SET" | grep -c '^[0-9]') in set"
