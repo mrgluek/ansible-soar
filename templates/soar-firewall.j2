@@ -62,9 +62,19 @@ start() {
     iptables -A SOAR_OUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
     iptables -A SOAR_OUT -p tcp -m set --match-set soar_relays dst \
         -m multiport --dports "$MAIL_PORTS" -j ACCEPT
-    # soar resolves relay names through systemd-resolved.
-    iptables -A SOAR_OUT -d 127.0.0.53 -p udp --dport 53 -j ACCEPT
-    iptables -A SOAR_OUT -d 127.0.0.53 -p tcp --dport 53 -j ACCEPT
+    # soar resolves relay names through the system resolver, whatever it is
+    # (systemd-resolved on 127.0.0.53, a chatmail relay's Unbound on
+    # 127.0.0.1, ...). Taken from resolv.conf on every start; a path unit
+    # re-runs this when resolv.conf changes (on 2026-10-27 a relay install
+    # switched it to Unbound and soar could no longer resolve anything).
+    # IPv4 only: soar gets no IPv6.
+    # Early in boot resolv.conf can still be a dangling symlink into /run;
+    # fall back to the systemd-resolved stub then.
+    nameservers=$(awk '$1 == "nameserver" && $2 !~ /:/ {print $2}' /etc/resolv.conf 2>/dev/null || true)
+    for ns in ${nameservers:-127.0.0.53}; do
+        iptables -A SOAR_OUT -d "$ns" -p udp --dport 53 -j ACCEPT
+        iptables -A SOAR_OUT -d "$ns" -p tcp --dport 53 -j ACCEPT
+    done
     iptables -A SOAR_OUT -j SET --add-set soar_rejected dst,dst --exist
     iptables -A SOAR_OUT -j REJECT
 

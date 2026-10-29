@@ -18,7 +18,7 @@ ansible-playbook -i inventory.ini soar_setup.yml -l ns.example.net
 | `soar-server` v0.2.0 (`/usr/local/bin`), built on the control machine | the tunnel; built locally because servers are small and may lack Go |
 | `soar.service`, user `soar`, UDP 5302 | runs unprivileged; public port 53 is redirected to it |
 | `/etc/soar/key` (root:soar 0640) | generated on the server on first run and never replaced |
-| `soar-firewall` + `soar-firewall.service` | 53 → 5302 redirect; chain `SOAR_OUT` lets soar reach only the relays (ipset `soar_relays`) on mail ports and the local resolver; no IPv6 for soar |
+| `soar-firewall` + `soar-firewall.service` | 53 → 5302 redirect; chain `SOAR_OUT` lets soar reach only the relays (ipset `soar_relays`) on mail ports and the resolvers from `resolv.conf`; no IPv6 for soar; `soar-firewall-resolv.path` re-applies it when `resolv.conf` changes |
 | `/etc/soar/relays.txt` + `soar-relays-update` + timer (30 min) | relay hostnames → ipset, entries expire after a day without refresh |
 | `stats.nft` + `soar-stats` + timer (10 min) | per-resolver traffic counters in SQLite (`soar-stats -d 7`); optional |
 | `soar-asn-labels.txt` next to the inventory (optional) | extra names for resolver networks in `soar-stats` reports |
@@ -30,7 +30,9 @@ the comment `soar`, so `soar-firewall stop` and re-runs touch nothing else.
 
 ## New server
 
-1. Server: Debian/Ubuntu with systemd-resolved, nothing public on UDP 53.
+1. Server: Debian/Ubuntu with a working resolver in `/etc/resolv.conf`
+   (systemd-resolved, Unbound, …) and nothing public on UDP 53. A chatmail
+   relay on the same host is fine.
 2. Inventory: `[soar]` group, `soar_zone=<zone>`; relay list next to it (see below).
 3. Run the playbook. The summary prints the public key and the Velta link
    `velta://tunnel?v=1&zone=…&key=…`.

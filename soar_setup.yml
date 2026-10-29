@@ -94,15 +94,17 @@
 
     - name: Install tools
       ansible.builtin.apt:
-        name: [ipset, iptables, nftables, bind9-dnsutils, python3, systemd-resolved]
+        name: [ipset, iptables, nftables, bind9-dnsutils, python3]
         state: present
         update_cache: yes
         cache_valid_time: 86400
 
-    # SOAR_OUT only lets soar talk DNS to 127.0.0.53, so the system resolver
-    # must be systemd-resolved's stub (default on Ubuntu, not on Debian).
-    - name: Check that systemd-resolved serves 127.0.0.53
-      ansible.builtin.command: resolvectl query -4 --legend=no {{ soar_ns }}
+    # soar resolves relay names through the resolvers in resolv.conf (any
+    # kind: systemd-resolved, a relay's Unbound, ...), so that must work.
+    # Nothing is installed here on purpose: adding systemd-resolved next to
+    # another resolver would take over resolv.conf.
+    - name: Check that the system resolver works
+      ansible.builtin.command: getent ahostsv4 {{ soar_ns }}
       changed_when: false
 
     # The redirect takes public UDP 53 away from anything bound to it, which
@@ -209,6 +211,8 @@
         mode: "0644"
       loop:
         - soar-firewall.service
+        - soar-firewall-resolv.path
+        - soar-firewall-reload.service
         - soar-relays.service
         - soar-relays.timer
         - soar-stats-nft.service
@@ -244,7 +248,7 @@
         enabled: yes
         state: started
         daemon_reload: yes
-      loop: [soar-firewall.service, soar-relays.timer, soar.service]
+      loop: [soar-firewall.service, soar-firewall-resolv.path, soar-relays.timer, soar.service]
 
     - name: Enable or disable traffic stats
       ansible.builtin.systemd_service:
@@ -269,16 +273,32 @@
         name: soar-relays.service
         state: started
 
-    # Straight to the server's port 53, as a resolver would: proves the
+    # First straight to the server's port 53, as a resolver would: proves the
     # redirect, soar and the zone name, independent of public delegation.
+    # Many networks intercept outgoing port 53 (UDP and TCP) and answer from
+    # their own resolver, so if that answer is not soar's, ask through public
+    # resolvers instead. Only soar answers with an SOA for the zone itself
+    # ("<zone>. SOA <zone>."); a missing delegation gets the parent's SOA.
     - name: Query soar through public port 53
       delegate_to: localhost
       become: no
-      ansible.builtin.command: dig +norec +time=3 +tries=2 @{{ ansible_facts.default_ipv4.address }} soar-check.{{ soar_zone }} TXT
+      ansible.builtin.shell: |
+        if dig +norec +time=3 +tries=2 @{{ ansible_facts.default_ipv4.address }} soar-check.{{ soar_zone }} TXT \
+            | grep -q 'flags: qr aa'; then
+          echo "direct"; exit 0
+        fi
+        for r in 8.8.8.8 77.88.8.8 1.1.1.1; do
+          if dig +time=4 +tries=1 @$r soar-check-$RANDOM.{{ soar_zone }} TXT +noall +authority \
+              | awk '$4 == "SOA" {print $1, $5}' | grep -qx '{{ soar_zone }}. {{ soar_zone }}.'; then
+            echo "via $r (port 53 to the server is intercepted from here)"; exit 0
+          fi
+        done
+        echo "soar did not answer, neither directly nor through public resolvers"; exit 1
+      args:
+        executable: /bin/bash   # $RANDOM
       register: soar_direct
       changed_when: false
       check_mode: false
-      failed_when: "'status: NOERROR' not in soar_direct.stdout or ' aa' not in soar_direct.stdout"
 
     # Asked at the parent zone's own name server: a recursive resolver would
     # follow the delegation to soar itself, which serves no NS records.
@@ -296,6 +316,7 @@
       ansible.builtin.debug:
         msg:
           - "zone {{ soar_zone }} -> {{ ansible_facts.default_ipv4.address }} ({{ soar_iface }}:53 -> soar:{{ soar_port }}), soar {{ soar_version }}"
+          - "soar answers: {{ soar_direct.stdout }}"
           - "relays in allowlist: {{ soar_relay_count.stdout }}"
           - >-
             {{ 'delegation OK: ' ~ soar_zone ~ ' NS ' ~ soar_ns

@@ -1,0 +1,10 @@
+[Unit]
+Description=Re-apply the soar firewall when the system resolver changes
+
+[Path]
+# SOAR_OUT allows DNS only to the nameservers in resolv.conf.
+PathChanged=/etc/resolv.conf
+Unit=soar-firewall-reload.service
+
+[Install]
+WantedBy=multi-user.target

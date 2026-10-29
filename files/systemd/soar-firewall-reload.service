@@ -1,0 +1,9 @@
+[Unit]
+Description=Re-apply the soar firewall rules (keeps soar running)
+After=soar-firewall.service
+
+[Service]
+Type=oneshot
+# "start" rebuilds the rules in place; restarting soar-firewall.service
+# instead would also restart soar (Requires=).
+ExecStart=/usr/local/sbin/soar-firewall start
