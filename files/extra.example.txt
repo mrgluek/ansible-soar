@@ -1,0 +1,20 @@
+# Fixed networks soar may reach besides the relays: "<network> <port>[,<port>...]"
+# (TCP), IPv4 or IPv6, "#" starts a comment. Copy next to your inventory as
+# soar-extra.txt; without that file soar reaches only the relays.
+#
+# Example: Telegram data centres (https://core.telegram.org/resources/cidr.txt),
+# HTTPS port only, for Telegram clients that use the tunnel as a SOCKS5 proxy.
+91.108.56.0/22     443
+91.108.4.0/22      443
+91.108.8.0/22      443
+91.108.16.0/22     443
+91.108.12.0/22     443
+149.154.160.0/20   443
+91.105.192.0/23    443
+91.108.20.0/22     443
+185.76.151.0/24    443
+2001:b28:f23d::/48 443
+2001:b28:f23f::/48 443
+2001:67c:4e8::/48  443
+2001:b28:f23c::/48 443
+2a0a:f280::/32     443

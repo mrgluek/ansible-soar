@@ -18,9 +18,10 @@ ansible-playbook -i inventory.ini soar_setup.yml -l ns.example.net
 | `soar-server` v0.2.0 (`/usr/local/bin`), built on the control machine | the tunnel; built locally because servers are small and may lack Go |
 | `soar.service`, user `soar`, UDP 5302 | runs unprivileged; public port 53 is redirected to it |
 | `/etc/soar/key` (root:soar 0640) | generated on the server on first run and never replaced |
-| `soar-firewall` + `soar-firewall.service` | 53 → 5302 redirect; chain `SOAR_OUT` lets soar reach only the relays (ipset `soar_relays`) on mail ports and the resolvers from `resolv.conf`; no IPv6 for soar; `soar-firewall-resolv.path` re-applies it when `resolv.conf` changes |
+| `soar-firewall` + `soar-firewall.service` | 53 → 5302 redirect; chain `SOAR_OUT` lets soar reach only the relays (ipset `soar_relays`) on mail ports and the resolvers from `resolv.conf`, plus the networks from `extra.txt`; over IPv6 only those networks; `soar-firewall-resolv.path` re-applies it when `resolv.conf` changes |
 | `/etc/soar/relays.txt` + `soar-relays-update` + timer (30 min) | relay hostnames → ipset, entries expire after a day without refresh |
 | `stats.nft` + `soar-stats` + timer (10 min) | per-resolver traffic counters in SQLite (`soar-stats -d 7`); optional |
+| `soar-extra.txt` next to the inventory (optional) → `/etc/soar/extra.txt` | fixed networks + ports soar may also reach (ipsets `soar_extra`, `soar_extra6`) |
 | `soar-asn-labels.txt` next to the inventory (optional) | extra names for resolver networks in `soar-stats` reports |
 
 The firewall does not use iptables-persistent: apt removes it whenever
@@ -65,6 +66,15 @@ hostname per line; start from `files/relays.example.txt`. It is deliberately
 not part of this repo: a published list of the relays tunnel users depend on
 is a ready-made block list. Edit it and re-run the playbook; on a server,
 `soar-relays-update` re-resolves it immediately.
+
+## Extra networks
+
+`soar-extra.txt` next to your inventory (or `soar_extra_file=<path>`): lines of
+`<network> <port>[,<port>...]`, IPv4 or IPv6, TCP. Use it for services that are
+not chatmail relays but should work through the tunnel, e.g. Telegram's data
+centres on 443 (see `files/extra.example.txt`). Everything else stays refused.
+Re-running the playbook re-applies the rules without restarting soar; without
+the file, `/etc/soar/extra.txt` is removed and so is the access.
 
 ## License
 

@@ -6,7 +6,8 @@
 #   - everything the soar user sends goes through chain SOAR_OUT, which only
 #     lets it reach chatmail relays (ipset soar_relays) on mail ports and the
 #     local resolver; anything else is refused and recorded in soar_rejected;
-#   - the soar user gets no IPv6 at all.
+#   - /etc/soar/extra.txt adds fixed networks on given ports (e.g. a messenger's
+#     data centres), IPv4 and IPv6; over IPv6 soar may reach nothing else.
 #
 #   soar-firewall [start]   (re)apply, safe to run any number of times
 #   soar-firewall stop      remove the rules (ipsets are kept)
@@ -23,6 +24,7 @@ IFACE={{ soar_iface }}
 PORT={{ soar_port }}
 MAIL_PORTS={{ soar_allow_ports }}
 SAVED=/etc/soar/relays.ipset
+EXTRA=/etc/soar/extra.txt
 
 # Delete every rule tagged "soar" from one chain. iptables -S prints rules as
 # "-A CHAIN args"; turning -A into -D gives the matching delete command.
@@ -42,7 +44,32 @@ stop() {
     fi
     if [ -e /proc/net/if_inet6 ]; then
         unsoar ip6tables filter OUTPUT
+        if ip6tables -n -L SOAR_OUT >/dev/null 2>&1; then
+            ip6tables -F SOAR_OUT
+            ip6tables -X SOAR_OUT
+        fi
     fi
+}
+
+# Fill soar_extra / soar_extra6 from $EXTRA: "<network> <port>[,<port>...]"
+# per line, TCP, "#" starts a comment. The sets are rebuilt on every start,
+# so removing a line removes the access. A bad line is reported and skipped
+# rather than failing the whole firewall (soar.service Requires= it).
+load_extra() {
+    ipset create -exist soar_extra hash:net,port family inet
+    ipset create -exist soar_extra6 hash:net,port family inet6
+    ipset flush soar_extra
+    ipset flush soar_extra6
+    [ -e "$EXTRA" ] || return 0
+    sed 's/#.*//' "$EXTRA" | while read -r net ports _; do
+        [ -n "$net" ] || continue
+        case $net in *:*) set=soar_extra6 ;; *) set=soar_extra ;; esac
+        for port in $(echo "${ports:-}" | tr ',' ' '); do
+            ipset add -exist "$set" "$net,tcp:$port" ||
+                echo "soar-firewall: skipped bad line in $EXTRA: $net $ports" >&2
+        done
+        [ -n "${ports:-}" ] || echo "soar-firewall: no port for $net in $EXTRA, skipped" >&2
+    done
 }
 
 start() {
@@ -55,6 +82,7 @@ start() {
     ipset create -exist soar_relays hash:ip timeout 86400
     # Refused destinations with counters; soar-stats reads and flushes it.
     ipset create -exist soar_rejected hash:ip,port timeout 3600 counters
+    load_extra
 
     stop
 
@@ -62,6 +90,8 @@ start() {
     iptables -A SOAR_OUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
     iptables -A SOAR_OUT -p tcp -m set --match-set soar_relays dst \
         -m multiport --dports "$MAIL_PORTS" -j ACCEPT
+    # The port is part of each set entry (dst,dst = address and port).
+    iptables -A SOAR_OUT -m set --match-set soar_extra dst,dst -j ACCEPT
     # soar resolves relay names through the system resolver, whatever it is
     # (systemd-resolved on 127.0.0.53, a chatmail relay's Unbound on
     # 127.0.0.1, ...). Taken from resolv.conf on every start; a path unit
@@ -84,8 +114,13 @@ start() {
     iptables -t nat -I PREROUTING -i "$IFACE" -p udp --dport 53 -m comment --comment soar \
         -j REDIRECT --to-ports "$PORT"
 
+    # IPv6: only the extra networks; relays and DNS stay IPv4-only.
     if [ -e /proc/net/if_inet6 ]; then
-        ip6tables -I OUTPUT -m owner --uid-owner soar -m comment --comment soar -j REJECT
+        ip6tables -N SOAR_OUT
+        ip6tables -A SOAR_OUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+        ip6tables -A SOAR_OUT -m set --match-set soar_extra6 dst,dst -j ACCEPT
+        ip6tables -A SOAR_OUT -j REJECT
+        ip6tables -I OUTPUT -m owner --uid-owner soar -m comment --comment soar -j SOAR_OUT
     fi
 }
 

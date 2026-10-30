@@ -73,6 +73,9 @@
     soar_relays_file: "{{ inventory_dir }}/soar-relays.txt"
     # Optional extra resolver network names for soar-stats ("ASN label" lines).
     soar_asn_labels_file: "{{ inventory_dir }}/soar-asn-labels.txt"
+    # Optional fixed networks soar may also reach ("<network> <ports>" lines,
+    # IPv4 or IPv6). No file = none. See files/extra.example.txt.
+    soar_extra_file: "{{ inventory_dir }}/soar-extra.txt"
     # soar_key: base64 private key (ansible-vault). Unset = keep the key on the
     # server, or generate one there on first run.
 
@@ -196,6 +199,23 @@
         src: "{{ soar_asn_labels_file }}"
         dest: /etc/soar/asn-labels.txt
         mode: "0644"
+
+    # Read by soar-firewall itself, so a change only needs the rules
+    # re-applied (reload), not soar restarted.
+    - name: Extra networks
+      when: soar_extra_file is file
+      ansible.builtin.copy:
+        src: "{{ soar_extra_file }}"
+        dest: /etc/soar/extra.txt
+        mode: "0644"
+      notify: reload soar-firewall
+
+    - name: No extra networks
+      when: soar_extra_file is not file
+      ansible.builtin.file:
+        path: /etc/soar/extra.txt
+        state: absent
+      notify: reload soar-firewall
 
     - name: Firewall script
       ansible.builtin.template:
@@ -332,6 +352,11 @@
         name: soar-firewall.service
         state: restarted
         daemon_reload: yes
+
+    - name: reload soar-firewall
+      ansible.builtin.systemd_service:
+        name: soar-firewall-reload.service
+        state: restarted
 
     - name: restart soar-stats-nft
       ansible.builtin.systemd_service:
