@@ -15,7 +15,7 @@ ansible-playbook -i inventory.ini soar_setup.yml -l ns.example.net
 
 | Piece | Why |
 |---|---|
-| `soar-server` v0.2.0 (`/usr/local/bin`), built on the control machine | the tunnel; built locally because servers are small and may lack Go |
+| `soar-server` v0.2.4 (`/usr/local/bin`), built on the control machine | the tunnel; built locally because servers are small and may lack Go |
 | `soar.service`, user `soar`, UDP 5302 | runs unprivileged; public port 53 is redirected to it |
 | `/etc/soar/key` (root:soar 0640) | generated on the server on first run and never replaced |
 | `soar-firewall` + `soar-firewall.service` | 53 → 5302 redirect; chain `SOAR_OUT` lets soar reach only the relays (ipset `soar_relays`) on mail ports and the resolvers from `resolv.conf`, plus the networks from `extra.txt`; over IPv6 only those networks; `soar-firewall-resolv.path` re-applies it when `resolv.conf` changes |

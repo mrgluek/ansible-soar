@@ -16,7 +16,7 @@
   check_mode: false
 
   vars:
-    soar_version: v0.2.0
+    soar_version: v0.2.4
     soar_build_dir: "{{ playbook_dir }}/.build"
     # ansible_facts.architecture -> GOARCH
     soar_goarch_map: { x86_64: amd64, aarch64: arm64, armv7l: arm }
@@ -54,7 +54,7 @@
   become: yes
 
   vars:
-    soar_version: v0.2.0
+    soar_version: v0.2.4
     soar_build_dir: "{{ playbook_dir }}/.build"
     soar_goarch_map: { x86_64: amd64, aarch64: arm64, armv7l: arm }
     # Interface that receives the public DNS queries (eth0, ens3, ...).
