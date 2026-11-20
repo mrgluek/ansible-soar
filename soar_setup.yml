@@ -32,6 +32,7 @@
         dest: "{{ soar_build_dir }}/soar-{{ soar_version }}"
         version: "{{ soar_version }}"
         depth: 1
+        update: false   # reuse an existing clone; the build below is cached too
 
     - name: Build soar-server for each target architecture
       delegate_to: localhost
