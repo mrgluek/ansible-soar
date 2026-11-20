@@ -91,6 +91,8 @@ def cymru(ip):
     if not origin:
         return "?", "?", "?"
     parts = [p.strip() for p in origin.split("|")]
+    if len(parts) < 3 or not parts[0].split():
+        return "?", "?", "?"   # not an answer of that shape (resolver error text, empty record)
     asn, cc = parts[0].split()[0], parts[2]
     info = dig_txt(f"AS{asn}.asn.cymru.com")  # "13335 | US | arin | ... | CLOUDFLARENET, US"
     return asn, cc, info.split("|")[-1].strip() if info else "?"
@@ -109,13 +111,25 @@ def asn_of(con, ip, lookup=True):
     return asn, cc, name
 
 
+def read_and_zero(name):
+    # reset = list + zero in one atomic step, so nothing is counted twice or lost.
+    # nftables before 1.0.7 (Debian 12) has no "reset set": list, then flush the set
+    # (a few packets between the two steps are not counted).
+    try:
+        return subprocess.run(["nft", "-j", "reset", "set", "inet", "soarstats", name],
+                              check=True, capture_output=True, text=True).stdout
+    except subprocess.CalledProcessError:
+        out = subprocess.run(["nft", "-j", "list", "set", "inet", "soarstats", name],
+                             check=True, capture_output=True, text=True).stdout
+        subprocess.run(["nft", "flush", "set", "inet", "soarstats", name], check=True)
+        return out
+
+
 def collect():
     now = int(time.time())
     rows = []
     for name, kind in SETS.items():
-        # reset = list + zero in one atomic step, so nothing is counted twice or lost
-        out = subprocess.run(["nft", "-j", "reset", "set", "inet", "soarstats", name],
-                             check=True, capture_output=True, text=True).stdout
+        out = read_and_zero(name)
         for item in json.loads(out)["nftables"]:
             for e in item.get("set", {}).get("elem", []):
                 e = e.get("elem", {})
