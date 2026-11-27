@@ -76,8 +76,10 @@ def prefix_of(ip):
 
 
 def dig_txt(name):
-    out = subprocess.run(["dig", "+short", "+time=2", "+tries=1", "TXT", name],
+    out = subprocess.run(["dig", "+short", "+time=5", "+tries=1", "TXT", name],
                          capture_output=True, text=True).stdout.strip()
+    if out.startswith(";;"):
+        return None  # dig prints DNS errors to stdout: not an answer
     return out.split("\n")[0].strip('"') if out else ""
 
 
@@ -88,6 +90,8 @@ def cymru(ip):
     else:
         q = ".".join(reversed(a.exploded.replace(":", ""))) + ".origin6.asn.cymru.com"
     origin = dig_txt(q)  # "13335 | 1.1.1.0/24 | AU | apnic | 2011-08-11"
+    if origin is None:
+        return None  # DNS error: not cached, retried next run
     if not origin:
         return "?", "?", "?"
     parts = [p.strip() for p in origin.split("|")]
@@ -95,6 +99,8 @@ def cymru(ip):
         return "?", "?", "?"   # not an answer of that shape (resolver error text, empty record)
     asn, cc = parts[0].split()[0], parts[2]
     info = dig_txt(f"AS{asn}.asn.cymru.com")  # "13335 | US | arin | ... | CLOUDFLARENET, US"
+    if info is None:
+        return None
     return asn, cc, info.split("|")[-1].strip() if info else "?"
 
 
@@ -105,7 +111,10 @@ def asn_of(con, ip, lookup=True):
         return row[:3]
     if not lookup:
         return "?", "?", "?"
-    asn, cc, name = cymru(ip)
+    res = cymru(ip)
+    if res is None:
+        return "?", "?", "?"   # DNS error: leave the cache alone, try again next run
+    asn, cc, name = res
     with con:
         con.execute("INSERT OR REPLACE INTO asn_prefix VALUES (?,?,?,?,?)", (pfx, asn, cc, name, int(time.time())))
     return asn, cc, name
@@ -170,8 +179,11 @@ def rejected(now):
 
 
 def ptr(ip):
-    out = subprocess.run(["dig", "+short", "+time=2", "+tries=1", "-x", ip], capture_output=True, text=True).stdout
-    return out.split("\n")[0].rstrip(".") or "?"
+    out = subprocess.run(["dig", "+short", "+time=5", "+tries=1", "-x", ip], capture_output=True, text=True).stdout
+    first = out.split("\n")[0]
+    if first.startswith(";;"):
+        return "?"
+    return first.rstrip(".") or "?"
 
 
 def relay_names():
